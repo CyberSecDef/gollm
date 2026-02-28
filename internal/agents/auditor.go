@@ -20,6 +20,9 @@ const (
 	auditLogFilename = "logs/audit.jsonl"
 )
 
+// AuditHook is a callback invoked for every message recorded by the Auditor.
+type AuditHook func(msg Message)
+
 // Auditor subscribes to all broadcast messages, writes them to a JSONL audit
 // log, and maintains an in-memory ring buffer for the TUI event pane.
 type Auditor struct {
@@ -30,6 +33,7 @@ type Auditor struct {
 	mu         sync.RWMutex
 	events     []Message
 	scratchpad strings.Builder
+	hook       AuditHook
 	logF       *os.File
 	cancel     context.CancelFunc
 	done       chan struct{}
@@ -99,6 +103,14 @@ func (a *Auditor) GetEvents() []Message {
 	return out
 }
 
+// RegisterHook sets a callback invoked for every message recorded by the Auditor.
+// Replaces any previously registered hook. Safe to call at any time.
+func (a *Auditor) RegisterHook(h AuditHook) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.hook = h
+}
+
 func (a *Auditor) loop(ctx context.Context) {
 	defer close(a.done)
 	for {
@@ -136,13 +148,19 @@ func (a *Auditor) record(msg Message) {
 
 	// Append to in-memory buffer, evicting oldest if full.
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if len(a.events) >= maxEventBuffer {
 		a.events = a.events[1:]
 	}
 	a.events = append(a.events, msg)
 	a.scratchpad.WriteString(fmt.Sprintf("[%s] %s → %s: %s\n",
 		msg.Timestamp.Format(time.RFC3339), msg.From, msg.To, msg.Type))
+	h := a.hook
+	a.mu.Unlock()
+
+	// Invoke hook outside the lock to prevent potential deadlocks.
+	if h != nil {
+		h(msg)
+	}
 }
 
 func (a *Auditor) setStatus(s AgentStatus) {

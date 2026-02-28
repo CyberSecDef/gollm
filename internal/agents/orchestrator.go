@@ -6,13 +6,24 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cybersecdef/gollm/internal/bus"
 	"github.com/cybersecdef/gollm/internal/llm"
 	"github.com/cybersecdef/gollm/internal/tools"
 )
 
-const orchestratorID = "orchestrator"
+const (
+	orchestratorID  = "orchestrator"
+	clarificationRole = "Clarification"
+	maxIterations   = 3
+	maxRetries      = 3
+	baseRetryDelay  = time.Second
+)
+
+// OrchestratorHook is a callback invoked at key lifecycle events in the loop.
+// event is a short identifier (e.g. "pre_synthesize"); metadata carries context.
+type OrchestratorHook func(event string, metadata map[string]string)
 
 // workerState tracks a spawned worker and its result.
 type workerState struct {
@@ -21,9 +32,32 @@ type workerState struct {
 	done   bool
 }
 
+// retryWithBackoff runs fn up to maxAttempts times with exponential backoff.
+// Delays: base, 2*base, 4*base, …
+func retryWithBackoff(ctx context.Context, maxAttempts int, base time.Duration, fn func() error) error {
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err = fn(); err == nil {
+			return nil
+		}
+		if attempt < maxAttempts-1 {
+			delay := base * (1 << uint(attempt))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+	}
+	return err
+}
+
 // Orchestrator owns the main control loop. It decomposes user requests into
-// subtasks, spawns Worker agents, collects results, and forwards them to the
-// Synthesizer.
+// subtasks, spawns Worker agents, collects results, checks acceptance criteria,
+// and forwards results to the Synthesizer.
 type Orchestrator struct {
 	id       string
 	bus      *bus.Bus
@@ -31,12 +65,14 @@ type Orchestrator struct {
 	registry *tools.Registry
 	inbox    <-chan Message
 
-	mu         sync.RWMutex
-	status     AgentStatus
-	workers    map[string]*workerState
-	resultCh   chan struct{}
-	workerSeq  atomic.Int64
-	scratchpad strings.Builder
+	mu              sync.RWMutex
+	status          AgentStatus
+	workers         map[string]*workerState
+	resultCh        chan struct{}
+	workerSeq       atomic.Int64
+	scratchpad      strings.Builder
+	clarificationCh chan string       // receives user answers to questions
+	synthHook       OrchestratorHook // called just before handing off to synthesizer
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -45,15 +81,24 @@ type Orchestrator struct {
 // NewOrchestrator creates an Orchestrator and subscribes it to the bus.
 func NewOrchestrator(b *bus.Bus, client llm.Client, registry *tools.Registry) *Orchestrator {
 	return &Orchestrator{
-		id:       orchestratorID,
-		bus:      b,
-		llm:      client,
-		registry: registry,
-		inbox:    b.Subscribe(orchestratorID),
-		workers:  make(map[string]*workerState),
-		resultCh: make(chan struct{}, 64),
-		done:     make(chan struct{}),
+		id:              orchestratorID,
+		bus:             b,
+		llm:             client,
+		registry:        registry,
+		inbox:           b.Subscribe(orchestratorID),
+		workers:         make(map[string]*workerState),
+		resultCh:        make(chan struct{}, 64),
+		clarificationCh: make(chan string, 1),
+		done:            make(chan struct{}),
 	}
+}
+
+// RegisterSynthesizerHook sets a hook called just before results are sent to
+// the synthesizer. Replaces any previously registered hook.
+func (o *Orchestrator) RegisterSynthesizerHook(h OrchestratorHook) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.synthHook = h
 }
 
 func (o *Orchestrator) ID() string            { return o.id }
@@ -112,39 +157,117 @@ func (o *Orchestrator) loop(ctx context.Context) {
 			case MsgTypeTaskResult:
 				o.handleTaskResult(msg)
 			case MsgTypeAnswer:
-				// Future: resume branched workflows.
+				// Deliver the answer to any goroutine blocked in askClarification.
+				select {
+				case o.clarificationCh <- msg.Content:
+				default:
+				}
 			}
 		}
 	}
 }
 
-// handleUserInput decomposes the request into subtasks and spawns workers.
+// handleUserInput runs the orchestration loop: decompose → spawn workers →
+// collect results → check acceptance criteria, iterating up to maxIterations.
+// It requests clarifications from the user when the LLM needs more context and
+// spawns new agents mid-loop as needed.
 func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 	o.setStatus(StatusWorking)
 	correlationID := msg.ID
+	goal := msg.Content
 
 	o.mu.Lock()
-	o.scratchpad.WriteString(fmt.Sprintf("[%s] Received: %s\n", correlationID, msg.Content))
+	o.scratchpad.WriteString(fmt.Sprintf("[%s] Goal: %s\n", correlationID, goal))
 	o.mu.Unlock()
 
-	o.emitEvent(ctx, "Received user input, decomposing task...")
+	o.emitEvent(ctx, "Received user goal, starting orchestration loop...")
 
-	subtasks, err := o.decompose(ctx, msg.Content)
-	if err != nil {
-		o.emitError(ctx, fmt.Sprintf("Decomposition failed: %v", err))
-		o.setStatus(StatusIdle)
-		return
+	var accumulated strings.Builder
+
+	for iter := 1; iter <= maxIterations; iter++ {
+		if ctx.Err() != nil {
+			return
+		}
+
+		o.emitEvent(ctx, fmt.Sprintf("[%d/%d] Decomposing tasks...", iter, maxIterations))
+
+		// Decompose with automatic retry/backoff.
+		subtasks, err := o.decomposeWithRetry(ctx, goal, accumulated.String())
+		if err != nil {
+			o.emitError(ctx, fmt.Sprintf("Decomposition failed: %v", err))
+			break
+		}
+		if len(subtasks) == 0 {
+			o.emitError(ctx, "No subtasks generated")
+			break
+		}
+
+		// If the LLM requests a user clarification, pause and ask.
+		if len(subtasks) == 1 && subtasks[0].role == clarificationRole {
+			o.emitEvent(ctx, "Requesting clarification from user...")
+			answer, ok := o.askClarification(ctx, subtasks[0].task)
+			if !ok {
+				return
+			}
+			goal = fmt.Sprintf("%s\nUser clarification: %s", goal, answer)
+			continue
+		}
+
+		o.emitEvent(ctx, fmt.Sprintf("[%d/%d] Spawning %d worker(s)...", iter, maxIterations, len(subtasks)))
+
+		// Spawn a new set of workers for this iteration.
+		iterWorkerIDs := o.spawnIterWorkers(ctx, subtasks)
+
+		// Wait for all iteration workers to finish.
+		iterResults := o.collectWorkerResults(ctx, iterWorkerIDs)
+		accumulated.WriteString(fmt.Sprintf("=== Iteration %d ===\n%s\n\n", iter, iterResults))
+
+		o.mu.Lock()
+		o.scratchpad.WriteString(fmt.Sprintf("[iter %d] collected %d chars\n", iter, len(iterResults)))
+		o.mu.Unlock()
+
+		o.emitEvent(ctx, fmt.Sprintf("[%d/%d] Checking acceptance criteria...", iter, maxIterations))
+
+		accepted, acceptErr := o.checkAcceptanceCriteria(ctx, goal, accumulated.String())
+		if acceptErr != nil {
+			// Treat a failed acceptance check as "not yet accepted" and continue.
+			o.emitEvent(ctx, fmt.Sprintf("[%d/%d] Acceptance check error: %v, continuing...", iter, maxIterations, acceptErr))
+			continue
+		}
+		if accepted {
+			o.emitEvent(ctx, fmt.Sprintf("Acceptance criteria met after iteration %d", iter))
+			break
+		}
+
+		o.emitEvent(ctx, fmt.Sprintf("[%d/%d] Criteria not yet met, refining...", iter, maxIterations))
 	}
-	if len(subtasks) == 0 {
-		o.emitError(ctx, "No subtasks generated")
-		o.setStatus(StatusIdle)
-		return
+
+	// Invoke pre-synthesis hook if registered.
+	o.mu.RLock()
+	hook := o.synthHook
+	o.mu.RUnlock()
+	if hook != nil {
+		hook("pre_synthesize", map[string]string{
+			"correlation_id": correlationID,
+			"goal":           goal,
+		})
 	}
 
-	o.emitEvent(ctx, fmt.Sprintf("Decomposed into %d subtask(s)", len(subtasks)))
+	o.emitEvent(ctx, "All iterations complete, sending to synthesizer...")
+	o.setStatus(StatusWaiting)
 
-	// Spawn workers and record their IDs.
+	synthMsg := NewMessage(MsgTypeTaskAssign, o.id, synthesizerID, accumulated.String())
+	synthMsg.Metadata["correlation_id"] = correlationID
+	o.bus.Publish(synthMsg)
+
+	o.setStatus(StatusIdle)
+}
+
+// spawnIterWorkers creates and starts a set of workers for one loop iteration.
+// It registers them in the shared workers map and returns their IDs.
+func (o *Orchestrator) spawnIterWorkers(ctx context.Context, subtasks []subtask) []string {
 	workerIDs := make([]string, 0, len(subtasks))
+
 	o.mu.Lock()
 	for _, st := range subtasks {
 		wid := fmt.Sprintf("worker-%d", o.workerSeq.Add(1))
@@ -156,7 +279,6 @@ func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 	}
 	o.mu.Unlock()
 
-	// Start workers.
 	for _, wid := range workerIDs {
 		o.mu.RLock()
 		ws := o.workers[wid]
@@ -167,15 +289,15 @@ func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 		}
 	}
 
-	// Wait for all workers, then synthesize.
-	go o.waitAndSynthesize(ctx, workerIDs, correlationID)
+	return workerIDs
 }
 
-// waitAndSynthesize waits until all workers finish and then forwards results to synthesizer.
-func (o *Orchestrator) waitAndSynthesize(ctx context.Context, workerIDs []string, correlationID string) {
+// collectWorkerResults blocks until every worker in the given set has finished,
+// then returns their combined output as a formatted string.
+func (o *Orchestrator) collectWorkerResults(ctx context.Context, workerIDs []string) string {
 	for {
 		if ctx.Err() != nil {
-			return
+			return ""
 		}
 
 		o.mu.RLock()
@@ -195,14 +317,13 @@ func (o *Orchestrator) waitAndSynthesize(ctx context.Context, workerIDs []string
 
 		select {
 		case <-ctx.Done():
-			return
+			return ""
 		case <-o.resultCh:
 		}
 	}
 
-	// Collect results.
-	o.mu.RLock()
 	var sb strings.Builder
+	o.mu.RLock()
 	for _, wid := range workerIDs {
 		ws := o.workers[wid]
 		if ws == nil {
@@ -214,12 +335,94 @@ func (o *Orchestrator) waitAndSynthesize(ctx context.Context, workerIDs []string
 	}
 	o.mu.RUnlock()
 
-	o.emitEvent(ctx, "All workers complete, sending to synthesizer...")
-	o.setStatus(StatusWaiting)
+	return sb.String()
+}
 
-	synthMsg := NewMessage(MsgTypeTaskAssign, o.id, synthesizerID, sb.String())
-	synthMsg.Metadata["correlation_id"] = correlationID
-	o.bus.Publish(synthMsg)
+// askClarification broadcasts a question to the user and blocks until an answer
+// arrives via MsgTypeAnswer or the context is cancelled.
+func (o *Orchestrator) askClarification(ctx context.Context, question string) (string, bool) {
+	o.setStatus(StatusWaiting)
+	o.bus.Publish(NewMessage(MsgTypeQuestion, o.id, "", question))
+
+	select {
+	case <-ctx.Done():
+		return "", false
+	case answer := <-o.clarificationCh:
+		o.setStatus(StatusWorking)
+		return answer, true
+	}
+}
+
+// checkAcceptanceCriteria asks the LLM whether the accumulated results satisfy
+// the user's original goal. Returns true when the goal is met.
+func (o *Orchestrator) checkAcceptanceCriteria(ctx context.Context, goal, results string) (bool, error) {
+	systemPrompt := `You are an acceptance criteria evaluator for a multi-agent system.
+Determine whether the collected results fully address the user's goal.
+Respond with exactly one of:
+ACCEPTED   – the goal is fully addressed
+NEEDS_MORE_WORK – more work is required`
+
+	userContent := fmt.Sprintf("Goal: %s\n\nCollected results:\n%s", goal, results)
+
+	var response string
+	err := retryWithBackoff(ctx, maxRetries, baseRetryDelay, func() error {
+		var callErr error
+		response, callErr = o.llm.Complete(ctx, []llm.ChatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userContent},
+		})
+		return callErr
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return strings.Contains(strings.ToUpper(response), "ACCEPTED"), nil
+}
+
+// decomposeWithRetry wraps decomposeWithContext with retry/backoff.
+func (o *Orchestrator) decomposeWithRetry(ctx context.Context, goal, previousResults string) ([]subtask, error) {
+	var tasks []subtask
+	err := retryWithBackoff(ctx, maxRetries, baseRetryDelay, func() error {
+		var callErr error
+		tasks, callErr = o.decomposeWithContext(ctx, goal, previousResults)
+		return callErr
+	})
+	return tasks, err
+}
+
+// decomposeWithContext calls the LLM to plan subtasks, optionally using
+// results from previous iterations to refine the plan.
+func (o *Orchestrator) decomposeWithContext(ctx context.Context, goal, previousResults string) ([]subtask, error) {
+	systemPrompt := `You are an orchestration agent. Decompose the user's goal into 2-3 specialist subtasks.
+Format each subtask on its own line as:
+SUBTASK_N|Role|Task description
+
+Where Role is one of: Researcher, Analyst, Coder, Writer, Reviewer
+If you need a clarification from the user before proceeding, respond with exactly one line:
+CLARIFICATION|Clarification|<your question>
+
+Example:
+SUBTASK_1|Researcher|Research the history of X
+SUBTASK_2|Analyst|Analyze the requirements for Y`
+
+	var userContent strings.Builder
+	userContent.WriteString("Goal: ")
+	userContent.WriteString(goal)
+	if previousResults != "" {
+		userContent.WriteString("\n\nPrevious iteration results:\n")
+		userContent.WriteString(previousResults)
+		userContent.WriteString("\n\nCreate subtasks to address any gaps or improve the results.")
+	}
+
+	response, err := o.llm.Complete(ctx, []llm.ChatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userContent.String()},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseSubtasks(response), nil
 }
 
 func (o *Orchestrator) handleTaskResult(msg Message) {
@@ -235,7 +438,7 @@ func (o *Orchestrator) handleTaskResult(msg Message) {
 	}
 	o.mu.Unlock()
 
-	// Notify waitAndSynthesize.
+// Notify collectWorkerResults.
 	select {
 	case o.resultCh <- struct{}{}:
 	default:
@@ -248,35 +451,13 @@ type subtask struct {
 	task string
 }
 
-// decompose calls the LLM to break the user request into role/task pairs.
-func (o *Orchestrator) decompose(ctx context.Context, userRequest string) ([]subtask, error) {
-	systemPrompt := `You are an orchestration agent. Decompose the user's request into 2-3 specialist subtasks.
-Format each subtask on its own line as:
-SUBTASK_N|Role|Task description
-
-Where Role is one of: Researcher, Analyst, Coder, Writer, Reviewer
-Example:
-SUBTASK_1|Researcher|Research the history of X
-SUBTASK_2|Analyst|Analyze the requirements for Y`
-
-	messages := []llm.ChatMessage{
-		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: "Decompose this request into subtasks: " + userRequest},
-	}
-
-	response, err := o.llm.Complete(ctx, messages)
-	if err != nil {
-		return nil, err
-	}
-	return parseSubtasks(response), nil
-}
-
-// parseSubtasks extracts SUBTASK_N|Role|Task lines from LLM output.
+// parseSubtasks extracts SUBTASK_N|Role|Task and CLARIFICATION|Clarification|Q lines.
 func parseSubtasks(response string) []subtask {
 	var tasks []subtask
 	for _, line := range strings.Split(response, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "SUBTASK_") {
+		// Accept both SUBTASK_ and CLARIFICATION prefixes.
+		if !strings.HasPrefix(line, "SUBTASK_") && !strings.HasPrefix(line, "CLARIFICATION") {
 			continue
 		}
 		parts := strings.SplitN(line, "|", 3)
