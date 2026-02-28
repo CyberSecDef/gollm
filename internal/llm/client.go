@@ -152,6 +152,8 @@ func (m *MockClient) Complete(_ context.Context, messages []ChatMessage) (string
 	lower := strings.ToLower(userMsg + systemMsg)
 
 	switch {
+	case strings.Contains(lower, "acceptance criteria evaluator") || strings.Contains(lower, "evaluator"):
+		return mockAcceptance(userMsg), nil
 	case strings.Contains(lower, "decompose") || strings.Contains(lower, "subtask"):
 		return mockDecompose(userMsg), nil
 	case strings.Contains(lower, "researcher") || strings.Contains(lower, "research"):
@@ -165,6 +167,10 @@ func (m *MockClient) Complete(_ context.Context, messages []ChatMessage) (string
 	default:
 		return mockGeneral(userMsg), nil
 	}
+}
+
+func mockAcceptance(_ string) string {
+	return "ACCEPTED"
 }
 
 func mockDecompose(input string) string {
