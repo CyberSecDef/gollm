@@ -13,8 +13,10 @@ type readFileTool struct{}
 
 func NewReadFile() Tool { return &readFileTool{} }
 
-func (t *readFileTool) Name() string        { return "read_file" }
-func (t *readFileTool) Description() string { return "Read the contents of a file. params: {\"path\":\"...\"}" }
+func (t *readFileTool) Name() string { return "read_file" }
+func (t *readFileTool) Description() string {
+	return "Read the contents of a file. params: {\"path\":\"...\"}"
+}
 
 func (t *readFileTool) Execute(_ context.Context, params map[string]string) (string, error) {
 	path, ok := params["path"]
@@ -34,8 +36,10 @@ type writeFileTool struct{}
 
 func NewWriteFile() Tool { return &writeFileTool{} }
 
-func (t *writeFileTool) Name() string        { return "write_file" }
-func (t *writeFileTool) Description() string { return "Write content to a file. params: {\"path\":\"...\",\"content\":\"...\"}" }
+func (t *writeFileTool) Name() string { return "write_file" }
+func (t *writeFileTool) Description() string {
+	return "Write content to a file. params: {\"path\":\"...\",\"content\":\"...\"}"
+}
 
 func (t *writeFileTool) Execute(_ context.Context, params map[string]string) (string, error) {
 	path, ok := params["path"]
@@ -55,8 +59,10 @@ type patchFileTool struct{}
 
 func NewPatchFile() Tool { return &patchFileTool{} }
 
-func (t *patchFileTool) Name() string        { return "patch_file" }
-func (t *patchFileTool) Description() string { return "Apply a unified diff patch to a file. params: {\"path\":\"...\",\"patch\":\"...\"}" }
+func (t *patchFileTool) Name() string { return "patch_file" }
+func (t *patchFileTool) Description() string {
+	return "Apply a unified diff patch to a file. params: {\"path\":\"...\",\"patch\":\"...\"}"
+}
 
 // Execute applies a simplified line-by-line patch to path.
 // The patch format is: lines starting with '-' are removed, lines starting with
