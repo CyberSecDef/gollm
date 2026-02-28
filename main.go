@@ -10,9 +10,36 @@ import (
 	"github.com/cybersecdef/gollm/internal/agents"
 	"github.com/cybersecdef/gollm/internal/bus"
 	"github.com/cybersecdef/gollm/internal/llm"
+	"github.com/cybersecdef/gollm/internal/msgs"
 	"github.com/cybersecdef/gollm/internal/tools"
 	"github.com/cybersecdef/gollm/internal/tui"
 )
+
+// busEventEmitter adapts the message bus to the tools.EventEmitter interface
+// so that the tool registry emits audit events on the bus before and after
+// every tool execution.
+type busEventEmitter struct {
+	b    *bus.Bus
+	from string
+}
+
+func (e *busEventEmitter) EmitToolCall(toolName string, params map[string]string) {
+	msg := agents.NewMessage(msgs.MsgTypeToolCall, e.from, "", fmt.Sprintf("pre-exec: %s", toolName))
+	msg.Metadata["tool"] = toolName
+	msg.Metadata["phase"] = "before"
+	e.b.Publish(msg)
+}
+
+func (e *busEventEmitter) EmitToolResult(toolName string, result string, err error) {
+	content := result
+	if err != nil {
+		content = fmt.Sprintf("error: %v", err)
+	}
+	msg := agents.NewMessage(msgs.MsgTypeToolResult, e.from, "", content)
+	msg.Metadata["tool"] = toolName
+	msg.Metadata["phase"] = "after"
+	e.b.Publish(msg)
+}
 
 func main() {
 	// Structured logger (logs go to a file so they don't interfere with TUI).
@@ -42,6 +69,11 @@ func main() {
 	registry.Register(tools.NewPatchFile())
 	registry.Register(tools.NewFetchURL())
 	registry.Register(tools.NewExecCommand())
+	registry.Register(tools.NewResearch())
+
+	// Wire the bus as an audit event emitter so the registry publishes
+	// tool_call / tool_result events before and after every tool execution.
+	registry.SetEventEmitter(&busEventEmitter{b: msgBus, from: "tool_registry"})
 
 	// --- LLM Client ---
 	llmClient := llm.NewOpenAIClient()
