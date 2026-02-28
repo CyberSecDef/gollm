@@ -63,6 +63,7 @@ type Orchestrator struct {
 	bus      *bus.Bus
 	llm      llm.Client
 	registry *tools.Registry
+	factory  *WorkerFactory // optional; used when spawning workers
 	inbox    <-chan Message
 
 	mu              sync.RWMutex
@@ -99,6 +100,16 @@ func (o *Orchestrator) RegisterSynthesizerHook(h OrchestratorHook) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.synthHook = h
+}
+
+// SetWorkerFactory configures the factory used when spawning workers.
+// When set, workers are created via the factory and inherit the registered
+// skill profile for their role (tools, rate limit, timeout, etc.).
+// Can be called at any time before or after Start.
+func (o *Orchestrator) SetWorkerFactory(f *WorkerFactory) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.factory = f
 }
 
 func (o *Orchestrator) ID() string            { return o.id }
@@ -270,12 +281,16 @@ func (o *Orchestrator) spawnIterWorkers(ctx context.Context, subtasks []subtask,
 	workerIDs := make([]string, 0, len(subtasks))
 
 	o.mu.Lock()
+	fac := o.factory
 	for _, st := range subtasks {
 		wid := fmt.Sprintf("worker-%d", o.workerSeq.Add(1))
-		ws := &workerState{
-			worker: NewWorker(wid, st.role, st.task, o.bus, o.llm, o.registry),
+		var w *Worker
+		if fac != nil {
+			w = fac.NewWorker(wid, st.role, st.task)
+		} else {
+			w = NewWorker(wid, st.role, st.task, o.bus, o.llm, o.registry)
 		}
-		o.workers[wid] = ws
+		o.workers[wid] = &workerState{worker: w}
 		workerIDs = append(workerIDs, wid)
 	}
 	o.mu.Unlock()
