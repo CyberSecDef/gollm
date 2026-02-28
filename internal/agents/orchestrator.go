@@ -31,11 +31,12 @@ type Orchestrator struct {
 	registry *tools.Registry
 	inbox    <-chan Message
 
-	mu        sync.RWMutex
-	status    AgentStatus
-	workers   map[string]*workerState
-	resultCh  chan struct{}
-	workerSeq atomic.Int64
+	mu         sync.RWMutex
+	status     AgentStatus
+	workers    map[string]*workerState
+	resultCh   chan struct{}
+	workerSeq  atomic.Int64
+	scratchpad strings.Builder
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -55,10 +56,18 @@ func NewOrchestrator(b *bus.Bus, client llm.Client, registry *tools.Registry) *O
 	}
 }
 
-func (o *Orchestrator) ID() string          { return o.id }
-func (o *Orchestrator) Role() string        { return "Orchestrator" }
-func (o *Orchestrator) Status() AgentStatus { o.mu.RLock(); defer o.mu.RUnlock(); return o.status }
-func (o *Orchestrator) Send(msg Message)    { o.bus.Publish(msg) }
+func (o *Orchestrator) ID() string            { return o.id }
+func (o *Orchestrator) Role() string          { return "Orchestrator" }
+func (o *Orchestrator) Status() AgentStatus   { o.mu.RLock(); defer o.mu.RUnlock(); return o.status }
+func (o *Orchestrator) Inbox() <-chan Message  { return o.inbox }
+func (o *Orchestrator) Send(msg Message)       { o.bus.Publish(msg) }
+
+// Scratchpad returns a snapshot of the orchestrator's planning notes.
+func (o *Orchestrator) Scratchpad() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.scratchpad.String()
+}
 
 // Start launches the orchestrator's event loop.
 func (o *Orchestrator) Start(ctx context.Context) error {
@@ -113,6 +122,10 @@ func (o *Orchestrator) loop(ctx context.Context) {
 func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 	o.setStatus(StatusWorking)
 	correlationID := msg.ID
+
+	o.mu.Lock()
+	o.scratchpad.WriteString(fmt.Sprintf("[%s] Received: %s\n", correlationID, msg.Content))
+	o.mu.Unlock()
 
 	o.emitEvent(ctx, "Received user input, decomposing task...")
 

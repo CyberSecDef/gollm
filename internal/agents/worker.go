@@ -5,11 +5,15 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cybersecdef/gollm/internal/bus"
 	"github.com/cybersecdef/gollm/internal/llm"
 	"github.com/cybersecdef/gollm/internal/tools"
 )
+
+// workerTaskTimeout is the maximum time allowed for a single LLM task.
+const workerTaskTimeout = 5 * time.Minute
 
 // Worker is a domain-expert agent that handles a single delegated subtask.
 // It maintains a private scratchpad and can invoke tools via the registry.
@@ -44,10 +48,11 @@ func NewWorker(id, role, task string, b *bus.Bus, client llm.Client, registry *t
 	}
 }
 
-func (w *Worker) ID() string          { return w.id }
-func (w *Worker) Role() string        { return w.role }
-func (w *Worker) Status() AgentStatus { w.mu.RLock(); defer w.mu.RUnlock(); return w.status }
-func (w *Worker) Send(msg Message)    { w.bus.Publish(msg) }
+func (w *Worker) ID() string             { return w.id }
+func (w *Worker) Role() string           { return w.role }
+func (w *Worker) Status() AgentStatus   { w.mu.RLock(); defer w.mu.RUnlock(); return w.status }
+func (w *Worker) Inbox() <-chan Message  { return w.inbox }
+func (w *Worker) Send(msg Message)       { w.bus.Publish(msg) }
 
 // Start begins the worker's processing loop.
 func (w *Worker) Start(ctx context.Context) error {
@@ -93,6 +98,10 @@ func (w *Worker) run(ctx context.Context) {
 }
 
 func (w *Worker) processTask(ctx context.Context) (string, error) {
+	// Enforce a per-task timeout so a stalled LLM call doesn't block indefinitely.
+	ctx, cancel := context.WithTimeout(ctx, workerTaskTimeout)
+	defer cancel()
+
 	systemPrompt := fmt.Sprintf(
 		"You are a %s specialist agent. Your task is: %s\n\n"+
 			"Work through the task step by step. Use your expertise to provide a detailed, "+
@@ -135,6 +144,13 @@ func (w *Worker) scratchPad(note string) {
 	defer w.mu.Unlock()
 	w.scratchpad.WriteString(note)
 	w.scratchpad.WriteString("\n")
+}
+
+// Scratchpad returns a snapshot of the worker's private working notes.
+func (w *Worker) Scratchpad() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.scratchpad.String()
 }
 
 func (w *Worker) setStatus(s AgentStatus) {
