@@ -118,9 +118,26 @@ func (w *Worker) Stop() {
 	<-w.done
 }
 
+// Done returns a channel that is closed when the worker has finished.
+func (w *Worker) Done() <-chan struct{} { return w.done }
+
 func (w *Worker) run(ctx context.Context) {
 	defer close(w.done)
 	defer w.bus.Unsubscribe(w.id)
+	defer func() {
+		if r := recover(); r != nil {
+			w.setStatus(StatusError)
+			errMsg := NewMessage(MsgTypeError, w.id, "", fmt.Sprintf("[%s] panic: %v", w.role, r))
+			errMsg.Metadata["role"] = w.role
+			errMsg.Metadata["panic"] = "true"
+			w.bus.Publish(errMsg)
+			// Still report a result so the orchestrator is not left waiting.
+			res := NewMessage(MsgTypeTaskResult, w.id, orchestratorID, fmt.Sprintf("panic recovered: %v", r))
+			res.Metadata["worker_id"] = w.id
+			res.Metadata["role"] = w.role
+			w.bus.Publish(res)
+		}
+	}()
 
 	w.emit(ctx, MsgTypeStatusUpdate, fmt.Sprintf("[%s] Starting task: %s", w.role, w.task))
 

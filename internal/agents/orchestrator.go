@@ -28,6 +28,16 @@ const (
 // event is a short identifier (e.g. "pre_synthesize"); metadata carries context.
 type OrchestratorHook func(event string, metadata map[string]string)
 
+// OrchestratorConfig holds optional runtime configuration for the Orchestrator.
+type OrchestratorConfig struct {
+	// MaxWorkers limits the number of concurrently running workers across all
+	// iterations. Zero (default) means unlimited.
+	MaxWorkers int
+	// TaskTimeout caps the total time allowed for a single handleUserInput
+	// execution. Zero means no extra limit beyond individual worker timeouts.
+	TaskTimeout time.Duration
+}
+
 // workerState tracks a spawned worker and its result.
 type workerState struct {
 	worker *Worker
@@ -80,23 +90,40 @@ type Orchestrator struct {
 	clarificationCh chan string       // receives user answers to questions
 	synthHook       OrchestratorHook // called just before handing off to synthesizer
 
+	semaphore chan struct{} // bounded worker pool; nil = unlimited
+	cfg       OrchestratorConfig
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
 // NewOrchestrator creates an Orchestrator and subscribes it to the bus.
 func NewOrchestrator(b *bus.Bus, client llm.Client, registry *tools.Registry) *Orchestrator {
-	return &Orchestrator{
+	return NewOrchestratorWithConfig(b, client, registry, OrchestratorConfig{})
+}
+
+// NewOrchestratorWithConfig creates an Orchestrator with the supplied configuration.
+func NewOrchestratorWithConfig(b *bus.Bus, client llm.Client, registry *tools.Registry, cfg OrchestratorConfig) *Orchestrator {
+	o := &Orchestrator{
 		id:              orchestratorID,
 		bus:             b,
 		llm:             client,
 		registry:        registry,
+		cfg:             cfg,
 		inbox:           b.Subscribe(orchestratorID),
 		workers:         make(map[string]*workerState),
 		resultCh:        make(chan struct{}, 64),
 		clarificationCh: make(chan string, 1),
 		done:            make(chan struct{}),
 	}
+	if cfg.MaxWorkers > 0 {
+		o.semaphore = make(chan struct{}, cfg.MaxWorkers)
+		// Pre-fill so acquire = receive (takes a slot) and release = send (returns a slot).
+		for i := 0; i < cfg.MaxWorkers; i++ {
+			o.semaphore <- struct{}{}
+		}
+	}
+	return o
 }
 
 // RegisterSynthesizerHook sets a hook called just before results are sent to
@@ -207,6 +234,15 @@ func (o *Orchestrator) loop(ctx context.Context) {
 // It requests clarifications from the user when the LLM needs more context and
 // spawns new agents mid-loop as needed.
 func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
+	defer func() {
+		if r := recover(); r != nil {
+			o.setStatus(StatusError)
+			errMsg := NewMessage(MsgTypeError, o.id, "", fmt.Sprintf("orchestrator panic: %v", r))
+			o.bus.Publish(errMsg)
+			o.setStatus(StatusIdle)
+		}
+	}()
+
 	// Create a task-scoped context so individual tasks can be stopped via
 	// MsgTypeStopRequest without affecting the agent's overall lifecycle.
 	taskCtx, taskCancel := context.WithCancel(ctx)
@@ -358,6 +394,29 @@ func (o *Orchestrator) spawnIterWorkers(ctx context.Context, subtasks []subtask,
 		o.mu.RLock()
 		ws := o.workers[wid]
 		o.mu.RUnlock()
+
+		// Acquire semaphore before starting each worker (backpressure / bounded pool).
+		if o.semaphore != nil {
+			select {
+			case <-o.semaphore: // acquire a slot
+			case <-ctx.Done():
+				return workerIDs
+			}
+			// Release the slot asynchronously when this worker finishes.
+			done := ws.worker.Done()
+			sem := o.semaphore
+			go func() {
+				select {
+				case <-done:
+				case <-ctx.Done():
+				}
+				select {
+				case sem <- struct{}{}: // release slot
+				default:
+				}
+			}()
+		}
+
 		o.emitEvent(ctx, correlationID, fmt.Sprintf("Spawning %s agent: %s", ws.worker.role, ws.worker.task))
 		if err := ws.worker.Start(ctx); err != nil {
 			o.emitError(ctx, correlationID, fmt.Sprintf("Failed to start worker %s: %v", wid, err))
