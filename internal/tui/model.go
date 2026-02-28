@@ -13,6 +13,10 @@ import (
 	"github.com/cybersecdef/gollm/internal/bus"
 )
 
+// numFocusablePanes is the total number of panes that can receive keyboard
+// focus. Update this constant whenever panes are added or removed.
+const numFocusablePanes = 5
+
 // focusedPane tracks which pane has keyboard focus.
 type focusedPane int
 
@@ -20,11 +24,15 @@ const (
 	paneConversation focusedPane = iota
 	paneAgentStatus
 	paneEventLog
+	paneOrchPlan
 	paneInput
 )
 
 // tickMsg is sent on each spinner tick.
 type tickMsg time.Time
+
+// agentMsgChanClosedMsg is sent when the auditor subscriber channel is closed.
+type agentMsgChanClosedMsg struct{}
 
 // Model is the top-level bubbletea model for the TUI.
 type Model struct {
@@ -32,6 +40,7 @@ type Model struct {
 	conversationViewport viewport.Model
 	agentStatusViewport  viewport.Model
 	eventLogViewport     viewport.Model
+	orchPlanViewport     viewport.Model
 	inputTextarea        textarea.Model
 
 	// Content state
@@ -48,16 +57,22 @@ type Model struct {
 		Send(msg agents.Message)
 		GetWorkerStatuses() map[string]agents.AgentStatus
 		Status() agents.AgentStatus
+		Scratchpad() string
+		GetCurrentIteration() int
 	}
 	auditor interface {
 		GetEvents() []agents.Message
+		Subscribe() <-chan agents.Message
 	}
 
-	// Channel for agent messages routed to TUI
+	// Channel for agent messages routed to TUI via auditor fan-out
 	msgChan <-chan agents.Message
 
 	// If an agent posted a question, hold it here until user answers
 	pendingQuestion *agents.Message
+
+	// Last user input, stored so Ctrl+R can retry it
+	lastUserInput string
 
 	// UI state
 	focused    focusedPane
@@ -73,9 +88,12 @@ func NewModel(
 		Send(msg agents.Message)
 		GetWorkerStatuses() map[string]agents.AgentStatus
 		Status() agents.AgentStatus
+		Scratchpad() string
+		GetCurrentIteration() int
 	},
 	aud interface {
 		GetEvents() []agents.Message
+		Subscribe() <-chan agents.Message
 	},
 ) Model {
 	ta := textarea.New()
@@ -90,12 +108,13 @@ func NewModel(
 		conversationViewport: viewport.New(0, 0),
 		agentStatusViewport:  viewport.New(0, 0),
 		eventLogViewport:     viewport.New(0, 0),
+		orchPlanViewport:     viewport.New(0, 0),
 		inputTextarea:        ta,
 		agentStatuses:        make(map[string]AgentInfo),
 		msgBus:               b,
 		orchestrator:         orch,
 		auditor:              aud,
-		msgChan:              b.Subscribe("tui"),
+		msgChan:              aud.Subscribe(),
 		focused:              paneInput,
 	}
 
@@ -123,10 +142,15 @@ func (m Model) Init() tea.Cmd {
 	)
 }
 
-// waitForAgentMsg returns a Cmd that blocks until an agent message arrives.
+// waitForAgentMsg returns a Cmd that blocks until an agent message arrives on
+// the auditor subscriber channel, or the channel is closed.
 func waitForAgentMsg(ch <-chan agents.Message) tea.Cmd {
 	return func() tea.Msg {
-		return <-ch
+		msg, ok := <-ch
+		if !ok {
+			return agentMsgChanClosedMsg{}
+		}
+		return msg
 	}
 }
 
@@ -157,11 +181,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
+		case "ctrl+x":
+			// Stop the current task.
+			if m.processing {
+				stopMsg := agents.NewMessage(agents.MsgTypeStopRequest, "user", "orchestrator", "stop")
+				m.msgBus.Publish(stopMsg)
+				m.processing = false
+				m.conversation = append(m.conversation, ConversationEntry{
+					Role:      "system",
+					Content:   "⏹ Task stopped by user.",
+					Timestamp: time.Now(),
+				})
+				m.updateConversationViewport()
+			}
+		case "ctrl+r":
+			// Retry the last user input.
+			if m.lastUserInput != "" && !m.processing {
+				m.processing = true
+				m.conversation = append(m.conversation, ConversationEntry{
+					Role:      "system",
+					Content:   fmt.Sprintf("↩ Retrying: %s", m.lastUserInput),
+					Timestamp: time.Now(),
+				})
+				userMsg := agents.NewMessage(agents.MsgTypeUserInput, "user", "orchestrator", m.lastUserInput)
+				m.msgBus.Publish(userMsg)
+				m.updateConversationViewport()
+			}
 		case "tab":
-			m.focused = (m.focused + 1) % 4
+			m.focused = (m.focused + 1) % numFocusablePanes
 			m.syncFocus()
 		case "shift+tab":
-			m.focused = (m.focused + 3) % 4
+			m.focused = (m.focused + numFocusablePanes - 1) % numFocusablePanes
 			m.syncFocus()
 		case "enter":
 			if m.focused == paneInput {
@@ -177,9 +227,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case agentMsgChanClosedMsg:
+		// Auditor channel closed (shutdown in progress) – stop listening.
+
 	case agents.Message:
 		m = m.handleAgentMessage(msg)
-		// Keep listening
+		// Keep listening for more messages.
 		cmds = append(cmds, waitForAgentMsg(m.msgChan))
 	}
 
@@ -190,6 +243,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.agentStatusViewport, c = m.agentStatusViewport.Update(msg)
 	cmds = append(cmds, c)
 	m.eventLogViewport, c = m.eventLogViewport.Update(msg)
+	cmds = append(cmds, c)
+	m.orchPlanViewport, c = m.orchPlanViewport.Update(msg)
 	cmds = append(cmds, c)
 
 	return m, tea.Batch(cmds...)
@@ -215,6 +270,7 @@ func (m Model) handleSubmit() (Model, tea.Cmd) {
 		})
 	} else {
 		// Normal user input
+		m.lastUserInput = input
 		m.conversation = append(m.conversation, ConversationEntry{
 			Role:      "user",
 			Content:   input,
@@ -314,6 +370,7 @@ func (m Model) handleAgentMessage(msg agents.Message) Model {
 	m.updateConversationViewport()
 	m.updateEventLogViewport()
 	m.updateAgentStatusViewport()
+	m.updateOrchestratorPlanViewport()
 	return m
 }
 
@@ -339,6 +396,13 @@ func (m *Model) handlePaneNav(msg tea.KeyMsg) Model {
 			m.eventLogViewport.LineUp(1)
 		case "down", "j":
 			m.eventLogViewport.LineDown(1)
+		}
+	case paneOrchPlan:
+		switch msg.String() {
+		case "up", "k":
+			m.orchPlanViewport.LineUp(1)
+		case "down", "j":
+			m.orchPlanViewport.LineDown(1)
 		}
 	}
 	return *m
@@ -368,6 +432,7 @@ func (m *Model) refreshAgentStatuses() {
 	orchInfo.Status = m.orchestrator.Status()
 	m.agentStatuses["orchestrator"] = orchInfo
 	m.updateAgentStatusViewport()
+	m.updateOrchestratorPlanViewport()
 }
 
 // relayout recalculates viewport dimensions based on terminal size.
@@ -381,11 +446,14 @@ func (m *Model) relayout() {
 	helpHeight := 1
 	topSectionHeight := m.height - inputHeight - helpHeight - 2
 
-	// Three top panes side by side
+	// Left pane: 50 % of total width.
+	// Right side: three equal-width panes sharing the remaining 50 %.
 	convWidth := m.width * 50 / 100
 	rightWidth := m.width - convWidth
-	statusWidth := rightWidth / 2
-	evtWidth := rightWidth - statusWidth
+	rightThird := rightWidth / 3
+	statusWidth := rightThird
+	evtWidth := rightThird
+	planWidth := rightWidth - 2*rightThird
 
 	// Inner heights = total - 2 (borders) - 1 (title)
 	innerH := topSectionHeight - 3
@@ -402,11 +470,15 @@ func (m *Model) relayout() {
 	m.eventLogViewport.Width = evtWidth - 4
 	m.eventLogViewport.Height = innerH
 
+	m.orchPlanViewport.Width = planWidth - 4
+	m.orchPlanViewport.Height = innerH
+
 	m.inputTextarea.SetWidth(m.width - 4)
 
 	m.updateConversationViewport()
 	m.updateAgentStatusViewport()
 	m.updateEventLogViewport()
+	m.updateOrchestratorPlanViewport()
 }
 
 func (m *Model) updateConversationViewport() {
@@ -425,6 +497,12 @@ func (m *Model) updateEventLogViewport() {
 	m.eventLogViewport.SetContent(content)
 }
 
+func (m *Model) updateOrchestratorPlanViewport() {
+	content := renderOrchestratorPlan(m.orchestrator.GetCurrentIteration(), agents.MaxIterations, m.orchestrator.Scratchpad())
+	m.orchPlanViewport.SetContent(content)
+	m.orchPlanViewport.GotoBottom()
+}
+
 // View renders the entire TUI.
 func (m Model) View() string {
 	if !m.ready {
@@ -433,8 +511,10 @@ func (m Model) View() string {
 
 	convWidth := m.width * 50 / 100
 	rightWidth := m.width - convWidth
-	statusWidth := rightWidth / 2
-	evtWidth := rightWidth - statusWidth
+	rightThird := rightWidth / 3
+	statusWidth := rightThird
+	evtWidth := rightThird
+	planWidth := rightWidth - 2*rightThird
 
 	inputHeight := 5
 	helpHeight := 1
@@ -444,6 +524,7 @@ func (m Model) View() string {
 	convBorder := paneStyle
 	statusBorder := paneStyle
 	evtBorder := paneStyle
+	planBorder := paneStyle
 	inputBorder := inputBarStyle
 
 	switch m.focused {
@@ -453,6 +534,8 @@ func (m Model) View() string {
 		statusBorder = focusedPaneStyle
 	case paneEventLog:
 		evtBorder = focusedPaneStyle
+	case paneOrchPlan:
+		planBorder = focusedPaneStyle
 	case paneInput:
 		inputBorder = inputBarStyle.BorderForeground(colorPrimary)
 	}
@@ -494,8 +577,15 @@ func (m Model) View() string {
 		Height(topH - 2).
 		Render(evtContent)
 
+	planTitle := titleStyle.Render("🗒 Plan")
+	planContent := planTitle + "\n" + m.orchPlanViewport.View()
+	planPane := planBorder.
+		Width(planWidth - 2).
+		Height(topH - 2).
+		Render(planContent)
+
 	// Layout top row
-	topRow := lipgloss.JoinHorizontal(lipgloss.Top, convPane, statusPane, evtPane)
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top, convPane, statusPane, evtPane, planPane)
 
 	// Input section
 	inputContent := m.inputTextarea.View()
@@ -505,8 +595,9 @@ func (m Model) View() string {
 	inputSection := inputBorder.Width(m.width - 4).Render(inputContent)
 
 	// Help line
-	help := helpStyle.Render("Tab: focus  •  Enter: send  •  ↑↓/jk: scroll  •  Ctrl+C: quit")
+	help := helpStyle.Render("Tab: focus  •  Enter: send  •  ↑↓/jk: scroll  •  Ctrl+X: stop  •  Ctrl+R: retry  •  Ctrl+C: quit")
 	helpLine := fmt.Sprintf("  %s", help)
 
 	return lipgloss.JoinVertical(lipgloss.Left, topRow, inputSection, helpLine)
 }
+

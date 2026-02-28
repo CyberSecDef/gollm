@@ -14,11 +14,14 @@ import (
 )
 
 const (
-	orchestratorID  = "orchestrator"
+	orchestratorID    = "orchestrator"
 	clarificationRole = "Clarification"
-	maxIterations   = 3
-	maxRetries      = 3
-	baseRetryDelay  = time.Second
+	maxIterations     = 3
+	// MaxIterations is exported so external packages (e.g. the TUI) can display
+	// iteration progress without hardcoding the value.
+	MaxIterations  = maxIterations
+	maxRetries     = 3
+	baseRetryDelay = time.Second
 )
 
 // OrchestratorHook is a callback invoked at key lifecycle events in the loop.
@@ -71,6 +74,8 @@ type Orchestrator struct {
 	workers         map[string]*workerState
 	resultCh        chan struct{}
 	workerSeq       atomic.Int64
+	currentIter     atomic.Int32
+	taskCancel      context.CancelFunc // cancels the running task; nil when idle
 	scratchpad      strings.Builder
 	clarificationCh chan string       // receives user answers to questions
 	synthHook       OrchestratorHook // called just before handing off to synthesizer
@@ -173,6 +178,14 @@ func (o *Orchestrator) loop(ctx context.Context) {
 				case o.clarificationCh <- msg.Content:
 				default:
 				}
+			case MsgTypeStopRequest:
+				// Cancel the currently running task if any.
+				o.mu.Lock()
+				cancel := o.taskCancel
+				o.mu.Unlock()
+				if cancel != nil {
+					cancel()
+				}
 			case MsgTypeFinalResponse:
 				// Confirm completion and emit a final event with exit code.
 				correlationID := msg.CorrelationID
@@ -194,6 +207,21 @@ func (o *Orchestrator) loop(ctx context.Context) {
 // It requests clarifications from the user when the LLM needs more context and
 // spawns new agents mid-loop as needed.
 func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
+	// Create a task-scoped context so individual tasks can be stopped via
+	// MsgTypeStopRequest without affecting the agent's overall lifecycle.
+	taskCtx, taskCancel := context.WithCancel(ctx)
+	o.mu.Lock()
+	o.taskCancel = taskCancel
+	o.mu.Unlock()
+	defer func() {
+		taskCancel()
+		o.mu.Lock()
+		o.taskCancel = nil
+		o.mu.Unlock()
+		o.currentIter.Store(0)
+		o.setStatus(StatusIdle)
+	}()
+
 	o.setStatus(StatusWorking)
 	correlationID := msg.ID
 	goal := msg.Content
@@ -202,32 +230,33 @@ func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 	o.scratchpad.WriteString(fmt.Sprintf("[%s] Goal: %s\n", correlationID, goal))
 	o.mu.Unlock()
 
-	o.emitEvent(ctx, correlationID, "Received user goal, starting orchestration loop...")
+	o.emitEvent(taskCtx, correlationID, "Received user goal, starting orchestration loop...")
 
 	var accumulated strings.Builder
 
 	for iter := 1; iter <= maxIterations; iter++ {
-		if ctx.Err() != nil {
+		if taskCtx.Err() != nil {
 			return
 		}
 
-		o.emitEvent(ctx, correlationID, fmt.Sprintf("[%d/%d] Decomposing tasks...", iter, maxIterations))
+		o.currentIter.Store(int32(iter))
+		o.emitEvent(taskCtx, correlationID, fmt.Sprintf("[%d/%d] Decomposing tasks...", iter, maxIterations))
 
 		// Decompose with automatic retry/backoff.
-		subtasks, err := o.decomposeWithRetry(ctx, goal, accumulated.String())
+		subtasks, err := o.decomposeWithRetry(taskCtx, goal, accumulated.String())
 		if err != nil {
-			o.emitError(ctx, correlationID, fmt.Sprintf("Decomposition failed: %v", err))
+			o.emitError(taskCtx, correlationID, fmt.Sprintf("Decomposition failed: %v", err))
 			break
 		}
 		if len(subtasks) == 0 {
-			o.emitError(ctx, correlationID, "No subtasks generated")
+			o.emitError(taskCtx, correlationID, "No subtasks generated")
 			break
 		}
 
 		// If the LLM requests a user clarification, pause and ask.
 		if len(subtasks) == 1 && subtasks[0].role == clarificationRole {
-			o.emitEvent(ctx, correlationID, "Requesting clarification from user...")
-			answer, ok := o.askClarification(ctx, subtasks[0].task)
+			o.emitEvent(taskCtx, correlationID, "Requesting clarification from user...")
+			answer, ok := o.askClarification(taskCtx, subtasks[0].task)
 			if !ok {
 				return
 			}
@@ -235,33 +264,38 @@ func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 			continue
 		}
 
-		o.emitEvent(ctx, correlationID, fmt.Sprintf("[%d/%d] Spawning %d worker(s)...", iter, maxIterations, len(subtasks)))
+		o.emitEvent(taskCtx, correlationID, fmt.Sprintf("[%d/%d] Spawning %d worker(s)...", iter, maxIterations, len(subtasks)))
 
 		// Spawn a new set of workers for this iteration.
-		iterWorkerIDs := o.spawnIterWorkers(ctx, subtasks, correlationID)
+		iterWorkerIDs := o.spawnIterWorkers(taskCtx, subtasks, correlationID)
 
 		// Wait for all iteration workers to finish.
-		iterResults := o.collectWorkerResults(ctx, iterWorkerIDs)
+		iterResults := o.collectWorkerResults(taskCtx, iterWorkerIDs)
 		accumulated.WriteString(fmt.Sprintf("=== Iteration %d ===\n%s\n\n", iter, iterResults))
 
 		o.mu.Lock()
 		o.scratchpad.WriteString(fmt.Sprintf("[iter %d] collected %d chars\n", iter, len(iterResults)))
 		o.mu.Unlock()
 
-		o.emitEvent(ctx, correlationID, fmt.Sprintf("[%d/%d] Checking acceptance criteria...", iter, maxIterations))
+		o.emitEvent(taskCtx, correlationID, fmt.Sprintf("[%d/%d] Checking acceptance criteria...", iter, maxIterations))
 
-		accepted, acceptErr := o.checkAcceptanceCriteria(ctx, goal, accumulated.String())
+		accepted, acceptErr := o.checkAcceptanceCriteria(taskCtx, goal, accumulated.String())
 		if acceptErr != nil {
 			// Treat a failed acceptance check as "not yet accepted" and continue.
-			o.emitEvent(ctx, correlationID, fmt.Sprintf("[%d/%d] Acceptance check error: %v, continuing...", iter, maxIterations, acceptErr))
+			o.emitEvent(taskCtx, correlationID, fmt.Sprintf("[%d/%d] Acceptance check error: %v, continuing...", iter, maxIterations, acceptErr))
 			continue
 		}
 		if accepted {
-			o.emitEvent(ctx, correlationID, fmt.Sprintf("Acceptance criteria met after iteration %d", iter))
+			o.emitEvent(taskCtx, correlationID, fmt.Sprintf("Acceptance criteria met after iteration %d", iter))
 			break
 		}
 
-		o.emitEvent(ctx, correlationID, fmt.Sprintf("[%d/%d] Criteria not yet met, refining...", iter, maxIterations))
+		o.emitEvent(taskCtx, correlationID, fmt.Sprintf("[%d/%d] Criteria not yet met, refining...", iter, maxIterations))
+	}
+
+	// Bail out if the task was stopped mid-execution.
+	if taskCtx.Err() != nil {
+		return
 	}
 
 	// Invoke pre-synthesis hook if registered.
@@ -275,7 +309,7 @@ func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 		})
 	}
 
-	o.emitEvent(ctx, correlationID, "All iterations complete, sending to synthesizer...")
+	o.emitEvent(taskCtx, correlationID, "All iterations complete, sending to synthesizer...")
 	o.setStatus(StatusWaiting)
 
 	// Append worker scratchpads to the content for traceability.
@@ -297,8 +331,7 @@ func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 	synthMsg.Metadata["orchestrator_plan"] = o.Scratchpad()
 	synthMsg.CorrelationID = correlationID
 	o.bus.Publish(synthMsg)
-
-	o.setStatus(StatusIdle)
+	// setStatus(StatusIdle) is handled by the deferred cleanup above.
 }
 
 // spawnIterWorkers creates and starts a set of workers for one loop iteration.
@@ -541,6 +574,12 @@ func (o *Orchestrator) setStatus(s AgentStatus) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.status = s
+}
+
+// GetCurrentIteration returns the iteration number currently being executed
+// (1-based), or 0 when the orchestrator is idle.
+func (o *Orchestrator) GetCurrentIteration() int {
+	return int(o.currentIter.Load())
 }
 
 // GetWorkerStatuses returns a snapshot of all spawned workers.
