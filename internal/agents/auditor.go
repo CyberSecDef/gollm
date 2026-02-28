@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,15 +23,16 @@ const (
 // Auditor subscribes to all broadcast messages, writes them to a JSONL audit
 // log, and maintains an in-memory ring buffer for the TUI event pane.
 type Auditor struct {
-	id     string
-	bus    *bus.Bus
-	inbox  <-chan Message
-	status AgentStatus
-	mu     sync.RWMutex
-	events []Message
-	logF   *os.File
-	cancel context.CancelFunc
-	done   chan struct{}
+	id         string
+	bus        *bus.Bus
+	inbox      <-chan Message
+	status     AgentStatus
+	mu         sync.RWMutex
+	events     []Message
+	scratchpad strings.Builder
+	logF       *os.File
+	cancel     context.CancelFunc
+	done       chan struct{}
 }
 
 // NewAuditor creates an Auditor but does not start it.
@@ -43,11 +45,19 @@ func NewAuditor(b *bus.Bus) *Auditor {
 	}
 }
 
-func (a *Auditor) ID() string          { return a.id }
-func (a *Auditor) Role() string        { return "Auditor" }
-func (a *Auditor) Status() AgentStatus { a.mu.RLock(); defer a.mu.RUnlock(); return a.status }
+func (a *Auditor) ID() string            { return a.id }
+func (a *Auditor) Role() string          { return "Auditor" }
+func (a *Auditor) Status() AgentStatus   { a.mu.RLock(); defer a.mu.RUnlock(); return a.status }
+func (a *Auditor) Inbox() <-chan Message  { return a.inbox }
 
 func (a *Auditor) Send(msg Message) { a.bus.Publish(msg) }
+
+// Scratchpad returns a summary of audit notes written during message recording.
+func (a *Auditor) Scratchpad() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.scratchpad.String()
+}
 
 // Start opens the audit log file and begins consuming broadcast messages.
 func (a *Auditor) Start(ctx context.Context) error {
@@ -131,6 +141,8 @@ func (a *Auditor) record(msg Message) {
 		a.events = a.events[1:]
 	}
 	a.events = append(a.events, msg)
+	a.scratchpad.WriteString(fmt.Sprintf("[%s] %s → %s: %s\n",
+		msg.Timestamp.Format(time.RFC3339), msg.From, msg.To, msg.Type))
 }
 
 func (a *Auditor) setStatus(s AgentStatus) {

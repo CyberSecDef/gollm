@@ -42,7 +42,12 @@ type Agent interface {
 	ID() string
 	Role() string
 	Status() AgentStatus
+	// Inbox returns the receive-only channel on which this agent receives messages.
+	Inbox() <-chan Message
+	// Scratchpad returns the agent's current private working notes.
+	Scratchpad() string
 	Start(ctx context.Context) error
 	Stop()
+	// Send publishes a message onto the shared bus (outbox).
 	Send(msg Message)
 }

@@ -15,14 +15,15 @@ const synthesizerID = "synthesizer"
 // Synthesizer merges worker task results into a single coherent final response
 // with citations referencing each contributing worker.
 type Synthesizer struct {
-	id     string
-	bus    *bus.Bus
-	llm    llm.Client
-	inbox  <-chan Message
-	mu     sync.RWMutex
-	status AgentStatus
-	cancel context.CancelFunc
-	done   chan struct{}
+	id         string
+	bus        *bus.Bus
+	llm        llm.Client
+	inbox      <-chan Message
+	mu         sync.RWMutex
+	status     AgentStatus
+	scratchpad strings.Builder
+	cancel     context.CancelFunc
+	done       chan struct{}
 }
 
 // NewSynthesizer creates a Synthesizer and subscribes it to the bus.
@@ -36,10 +37,18 @@ func NewSynthesizer(b *bus.Bus, client llm.Client) *Synthesizer {
 	}
 }
 
-func (s *Synthesizer) ID() string          { return s.id }
-func (s *Synthesizer) Role() string        { return "Synthesizer" }
-func (s *Synthesizer) Status() AgentStatus { s.mu.RLock(); defer s.mu.RUnlock(); return s.status }
-func (s *Synthesizer) Send(msg Message)    { s.bus.Publish(msg) }
+func (s *Synthesizer) ID() string            { return s.id }
+func (s *Synthesizer) Role() string          { return "Synthesizer" }
+func (s *Synthesizer) Status() AgentStatus   { s.mu.RLock(); defer s.mu.RUnlock(); return s.status }
+func (s *Synthesizer) Inbox() <-chan Message  { return s.inbox }
+func (s *Synthesizer) Send(msg Message)       { s.bus.Publish(msg) }
+
+// Scratchpad returns a snapshot of the synthesizer's working notes.
+func (s *Synthesizer) Scratchpad() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.scratchpad.String()
+}
 
 // Start begins the synthesizer's event loop.
 func (s *Synthesizer) Start(ctx context.Context) error {
@@ -85,6 +94,10 @@ func (s *Synthesizer) loop(ctx context.Context) {
 func (s *Synthesizer) synthesize(ctx context.Context, assignMsg Message) {
 	s.setStatus(StatusWorking)
 	s.emitStatus(ctx, "Synthesizing worker outputs...")
+
+	s.mu.Lock()
+	s.scratchpad.WriteString(fmt.Sprintf("Synthesizing correlation=%s\n", assignMsg.Metadata["correlation_id"]))
+	s.mu.Unlock()
 
 	systemPrompt := `You are a synthesis specialist. You will receive multiple expert agent outputs.
 Your job is to:
