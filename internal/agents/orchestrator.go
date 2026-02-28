@@ -173,6 +173,17 @@ func (o *Orchestrator) loop(ctx context.Context) {
 				case o.clarificationCh <- msg.Content:
 				default:
 				}
+			case MsgTypeFinalResponse:
+				// Confirm completion and emit a final event with exit code.
+				correlationID := msg.CorrelationID
+				if correlationID == "" {
+					correlationID = msg.Metadata["correlation_id"]
+				}
+				done := NewMessage(MsgTypeEvent, o.id, "", "Task complete")
+				done.Metadata["exit_code"] = "0"
+				done.Metadata["correlation_id"] = correlationID
+				done.CorrelationID = correlationID
+				o.bus.Publish(done)
 			}
 		}
 	}
@@ -267,8 +278,23 @@ func (o *Orchestrator) handleUserInput(ctx context.Context, msg Message) {
 	o.emitEvent(ctx, correlationID, "All iterations complete, sending to synthesizer...")
 	o.setStatus(StatusWaiting)
 
-	synthMsg := NewMessage(MsgTypeTaskAssign, o.id, synthesizerID, accumulated.String())
+	// Append worker scratchpads to the content for traceability.
+	var padBuilder strings.Builder
+	o.mu.RLock()
+	for id, ws := range o.workers {
+		if pad := ws.worker.Scratchpad(); pad != "" {
+			padBuilder.WriteString(fmt.Sprintf("=== %s (%s) Scratchpad ===\n%s\n\n", ws.worker.role, id, pad))
+		}
+	}
+	o.mu.RUnlock()
+	content := accumulated.String()
+	if padBuilder.Len() > 0 {
+		content += "\n=== WORKER SCRATCHPADS ===\n" + padBuilder.String()
+	}
+
+	synthMsg := NewMessage(MsgTypeTaskAssign, o.id, synthesizerID, content)
 	synthMsg.Metadata["correlation_id"] = correlationID
+	synthMsg.Metadata["orchestrator_plan"] = o.Scratchpad()
 	synthMsg.CorrelationID = correlationID
 	o.bus.Publish(synthMsg)
 
