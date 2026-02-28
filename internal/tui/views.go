@@ -9,6 +9,36 @@ import (
 	"github.com/cybersecdef/gollm/internal/agents"
 )
 
+// renderOrchestratorPlan renders the orchestrator plan/iteration pane content.
+func renderOrchestratorPlan(currentIter, maxIter int, plan string) string {
+	var sb strings.Builder
+
+	// Iteration indicator
+	iterLine := "Idle"
+	if currentIter > 0 {
+		iterLine = fmt.Sprintf("Iteration %d / %d", currentIter, maxIter)
+	}
+	sb.WriteString(statusWorkingStyle.Render(iterLine))
+	sb.WriteString("\n\n")
+
+	if plan == "" {
+		sb.WriteString(helpStyle.Render("No plan recorded yet."))
+		return sb.String()
+	}
+
+	// Show the last N lines of the plan scratchpad so older entries scroll off.
+	const maxPlanLines = 50
+	lines := strings.Split(strings.TrimRight(plan, "\n"), "\n")
+	if len(lines) > maxPlanLines {
+		lines = lines[len(lines)-maxPlanLines:]
+	}
+	for _, line := range lines {
+		sb.WriteString(eventContentStyle.Render(line))
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
 // renderConversation renders the conversation pane content.
 func renderConversation(entries []ConversationEntry) string {
 	if len(entries) == 0 {

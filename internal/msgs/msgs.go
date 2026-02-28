@@ -19,6 +19,7 @@ const (
 	MsgTypeShutdown      MessageType = "shutdown"
 	MsgTypeFinalResponse MessageType = "final_response"
 	MsgTypeError         MessageType = "error"
+	MsgTypeStopRequest   MessageType = "stop_request"
 )
 
 // Message is the unit of communication on the message bus.

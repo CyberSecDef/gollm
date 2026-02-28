@@ -398,3 +398,138 @@ type funcClient struct {
 func (f *funcClient) Complete(ctx context.Context, messages []llm.ChatMessage) (string, error) {
 	return f.fn(ctx, messages)
 }
+
+// ---- GetCurrentIteration / MsgTypeStopRequest -------------------------------
+
+func TestGetCurrentIteration_IdleIsZero(t *testing.T) {
+	orch, _ := newTestOrchestrator(&llm.MockClient{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := orch.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer orch.Stop()
+
+	if got := orch.GetCurrentIteration(); got != 0 {
+		t.Errorf("expected GetCurrentIteration() == 0 when idle, got %d", got)
+	}
+}
+
+func TestGetCurrentIteration_ReturnsNonZeroWhileRunning(t *testing.T) {
+	// LLM that blocks until the context is done so we can observe the iteration.
+	ready := make(chan struct{})
+	block := make(chan struct{})
+
+	mockLLM := &funcClient{fn: func(ctx context.Context, messages []llm.ChatMessage) (string, error) {
+		// Signal that the LLM call is in progress.
+		select {
+		case ready <- struct{}{}:
+		default:
+		}
+		// Block until the test unblocks or ctx is cancelled.
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return "SUBTASK_1|Analyst|task", nil
+	}}
+
+	orch, b := newTestOrchestrator(mockLLM)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := orch.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer orch.Stop()
+
+	userMsg := NewMessage(MsgTypeUserInput, "user", orchestratorID, "test goal")
+	b.Publish(userMsg)
+
+	// Wait for the first LLM call to start.
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first LLM call")
+	}
+
+	if got := orch.GetCurrentIteration(); got == 0 {
+		t.Error("expected GetCurrentIteration() > 0 while orchestrator is running")
+	}
+
+	// Unblock the LLM and let the orchestrator finish.
+	close(block)
+}
+
+func TestStopRequest_CancelsRunningTask(t *testing.T) {
+	// LLM that blocks until signalled – used to hold the orchestrator in iteration 1.
+	ready := make(chan struct{})
+	block := make(chan struct{})
+
+	mockLLM := &funcClient{fn: func(ctx context.Context, messages []llm.ChatMessage) (string, error) {
+		select {
+		case ready <- struct{}{}:
+		default:
+		}
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+		return "SUBTASK_1|Analyst|task", nil
+	}}
+
+	orch, b := newTestOrchestrator(mockLLM)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := orch.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer orch.Stop()
+
+	// Start a task.
+	userMsg := NewMessage(MsgTypeUserInput, "user", orchestratorID, "blocking goal")
+	b.Publish(userMsg)
+
+	// Wait until the task is in progress.
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for task to start")
+	}
+
+	// Verify orchestrator is working.
+	if orch.Status() != StatusWorking {
+		t.Errorf("expected StatusWorking, got %s", orch.Status())
+	}
+
+	// Send a stop request.
+	stopMsg := NewMessage(MsgTypeStopRequest, "user", orchestratorID, "stop")
+	b.Publish(stopMsg)
+
+	// Wait for the orchestrator to return to idle (max 5 s).
+	deadline := time.After(5 * time.Second)
+	for {
+		if orch.Status() == StatusIdle {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("orchestrator did not return to idle after stop request; status=%s", orch.Status())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	// currentIter should be reset to 0 after stop.
+	if got := orch.GetCurrentIteration(); got != 0 {
+		t.Errorf("expected GetCurrentIteration() == 0 after stop, got %d", got)
+	}
+
+	// Unblock any pending LLM calls so goroutines can clean up.
+	close(block)
+}

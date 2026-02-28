@@ -26,6 +26,7 @@ const (
 	MsgTypeShutdown      = msgs.MsgTypeShutdown
 	MsgTypeFinalResponse = msgs.MsgTypeFinalResponse
 	MsgTypeError         = msgs.MsgTypeError
+	MsgTypeStopRequest   = msgs.MsgTypeStopRequest
 
 	StatusIdle      = msgs.StatusIdle
 	StatusWorking   = msgs.StatusWorking
