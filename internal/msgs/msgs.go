@@ -23,13 +23,14 @@ const (
 
 // Message is the unit of communication on the message bus.
 type Message struct {
-	ID        string
-	Type      MessageType
-	From      string
-	To        string // empty = broadcast
-	Content   string
-	Metadata  map[string]string
-	Timestamp time.Time
+	ID            string
+	Type          MessageType
+	From          string
+	To            string // empty = broadcast
+	Content       string
+	Metadata      map[string]string
+	Timestamp     time.Time
+	CorrelationID string // links related messages across an orchestration run
 }
 
 // AgentStatus represents the lifecycle state of an agent.

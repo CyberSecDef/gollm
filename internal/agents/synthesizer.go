@@ -126,6 +126,7 @@ Your job is to:
 	// Post the final response so the TUI and orchestrator can display it.
 	finalMsg := NewMessage(MsgTypeFinalResponse, s.id, "", result)
 	finalMsg.Metadata["correlation_id"] = assignMsg.Metadata["correlation_id"]
+	finalMsg.CorrelationID = assignMsg.CorrelationID
 	s.bus.Publish(finalMsg)
 
 	s.setStatus(StatusIdle)
